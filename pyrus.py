@@ -334,4 +334,3 @@ if __name__ == "__main__":
     require_root()
     app = PyrusCryptGUI()
     app.mainloop()
-
