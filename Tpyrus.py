@@ -21,7 +21,7 @@ import shutil
 from datetime import datetime
 
 
-import argparse
+import getpass
 
 APP_TITLE = "PyrusCrypt – Reencriptador LUKS"
 
@@ -98,15 +98,7 @@ def print_log(text: str):
     print(line, end='')
 
 def main():
-    parser = argparse.ArgumentParser(description="PyrusCrypt – Reencriptador LUKS (terminal)")
-    parser.add_argument('--device', required=True, help='Ruta del dispositivo o partición (ej: /dev/sda1)')
-    parser.add_argument('--password', required=True, help='Contraseña LUKS')
-    parser.add_argument('--reduce-size', default='32M', help='Tamaño a reducir el dispositivo (ej: 32M)')
-    parser.add_argument('--fsck', action='store_true', help='Ejecutar e2fsck -f -y antes de reencriptar')
-    parser.add_argument('--minimize', action='store_true', help='resize2fs -M antes de reencriptar')
-    parser.add_argument('--chroot', action='store_true', help='Montar y configurar sistema (chroot + GRUB)')
-    args = parser.parse_args()
-
+    print("\nPyrusCrypt – Reencriptador LUKS (terminal)")
     require_root()
 
     if not cmd_exists("cryptsetup"):
@@ -117,12 +109,51 @@ def main():
             print(f"ERROR: No se encontró '{tool}'.")
             sys.exit(1)
 
-    device = args.device
-    password = args.password
-    reduce_size = args.reduce_size
-    run_fsck = args.fsck
-    run_minimize = args.minimize
-    run_chroot = args.chroot
+    # Listar dispositivos
+    devices = list_block_devices()
+    if not devices:
+        print("No se detectaron dispositivos.")
+        sys.exit(1)
+    print("\nDispositivos detectados:")
+    for idx, d in enumerate(devices):
+        mount = f" (montado en {d['mountpoint']})" if d['mountpoint'] else ""
+        print(f"  [{idx}] {d['path']} [{d['type']}] {d['size']}{mount}")
+    while True:
+        sel = input("\nElige el número del dispositivo a reencriptar: ").strip()
+        if sel.isdigit() and int(sel) < len(devices):
+            device = devices[int(sel)]['path']
+            break
+        print("Opción inválida. Intenta de nuevo.")
+
+    # Contraseña
+    while True:
+        password = getpass.getpass("Contraseña LUKS: ")
+        password2 = getpass.getpass("Confirmar contraseña: ")
+        if not password:
+            print("La contraseña no puede estar vacía.")
+        elif password != password2:
+            print("Las contraseñas no coinciden.")
+        else:
+            break
+
+    reduce_size = input("Reduce device size (cryptsetup) [32M]: ").strip() or "32M"
+
+    # Opciones
+    def ask_bool(msg, default=True):
+        s = input(f"{msg} [{'S/n' if default else 's/N'}]: ").strip().lower()
+        if s == '':
+            return default
+        return s in ['s', 'si', 'y', 'yes']
+
+    run_fsck = ask_bool("¿Ejecutar e2fsck -f -y (recomendado)?", True)
+    run_minimize = ask_bool("¿resize2fs -M antes del reencriptado?", True)
+    run_chroot = ask_bool("¿Montar y configurar sistema (chroot + GRUB)?", False)
+
+    print(f"\nVas a reencriptar: {device}\nEsto puede tardar mucho tiempo y es arriesgado.")
+    confirm = ask_bool("¿Continuar?", False)
+    if not confirm:
+        print("Cancelado por el usuario.")
+        sys.exit(0)
 
     keyfile = None
     try:
