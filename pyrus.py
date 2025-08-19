@@ -23,7 +23,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-APP_TITLE = "PyrusCrypt – Reencriptador LUKS"
+APP_TITLE = "PyrusCrypt"
 
 # --------------------------- Utilidades de sistema --------------------------- #
 
@@ -31,7 +31,7 @@ def require_root():
     if os.geteuid() != 0:
         messagebox.showerror(
             "Permisos insuficientes",
-            "Esta aplicación debe ejecutarse como root.\n\nEjemplo: sudo python3 pyruscrypt_gui.py",
+            "Esta aplicación debe ejecutarse como root.\n\nEjemplos:\n- sudo python3 pyrus.py\n- sudo ./PyrusCrypt",
         )
         sys.exit(1)
 
@@ -96,15 +96,93 @@ def list_block_devices():
 class PyrusCryptGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_TITLE)
+        self.title("🐉 " + APP_TITLE + " 🔒")
         self.geometry("820x600")
         self.minsize(780, 560)
+        
+        self._configure_styles()
         self._build_ui()
         self.refresh_devices()
+
+    def _configure_styles(self):
+        self.configure(bg="#0F1C17")  # Fondo principal verde muy oscuro
+        style = ttk.Style(self)
+        style.theme_use('clam')
+
+        # Paleta de colores de fantasía
+        BG_COLOR = "#0F1C17"      # Verde muy oscuro (fondo principal)
+        FG_COLOR = "#D2B26E"      # Dorado (texto y acentos)
+        ALT_BG_COLOR = "#162720"  # Verde alterno más claro
+        SELECT_BG = "#1E342B"     # Verde más intenso (hover/selección)
+        SELECT_FG = "#E8D6A2"     # Dorado claro (estados activos)
+        BORDER_COLOR = "#2A3B33"  # Verde grisáceo oscuro
+
+        style.configure('.',
+                        background=BG_COLOR,
+                        foreground=FG_COLOR,
+                        fieldbackground=ALT_BG_COLOR,
+                        troughcolor=ALT_BG_COLOR,
+                        darkcolor=BORDER_COLOR,
+                        lightcolor=BORDER_COLOR,
+                        bordercolor=BORDER_COLOR)
+
+        style.map('.',
+                  background=[('active', SELECT_BG), ('disabled', ALT_BG_COLOR)],
+                  foreground=[('active', SELECT_FG), ('disabled', '#8B7355')])
+
+        style.configure('TLabel',
+                        background=BG_COLOR,
+                        foreground=FG_COLOR)
+
+        style.configure('TButton',
+                        background=ALT_BG_COLOR,
+                        foreground=FG_COLOR,
+                        relief=tk.FLAT,
+                        borderwidth=1)
+        style.map('TButton',
+                  background=[('active', SELECT_BG), ('pressed', SELECT_BG)],
+                  foreground=[('active', SELECT_FG), ('pressed', SELECT_FG)])
+
+        style.configure('TCombobox',
+                        fieldbackground=ALT_BG_COLOR,
+                        background=ALT_BG_COLOR,
+                        foreground=FG_COLOR,
+                        arrowcolor=FG_COLOR,
+                        selectbackground=SELECT_BG,
+                        selectforeground=SELECT_FG)
+        
+        style.configure('TEntry',
+                        fieldbackground=ALT_BG_COLOR,
+                        foreground=FG_COLOR,
+                        insertcolor=FG_COLOR)
+
+        style.configure('Horizontal.TProgressbar',
+                        background=FG_COLOR,      # Barra dorada
+                        troughcolor=ALT_BG_COLOR) # Fondo verde oscuro
+                        
+        style.configure('TCheckbutton',
+                        background=BG_COLOR,
+                        foreground=FG_COLOR)
+        style.map('TCheckbutton',
+                  background=[('active', BG_COLOR)],
+                  indicatorcolor=[('selected', FG_COLOR), ('!selected', ALT_BG_COLOR)])
+
+    def on_device_selected(self, event=None):
+        self.dev_combo.master.focus()
+        style = ttk.Style(self)
+        style.map('TCombobox',
+                  fieldbackground=[('readonly', '#1A1A1A')],
+                  foreground=[('readonly', '#00FF00')])
 
     def _build_ui(self):
         frm = ttk.Frame(self, padding=14)
         frm.pack(fill=tk.BOTH, expand=True)
+        
+        # Configurar estilo para el Combobox antes de crearlo
+        style = ttk.Style(self)
+        style.map('TCombobox',
+                  fieldbackground=[('readonly', '#1A1A1A')],
+                  foreground=[('readonly', '#555555')]) # Color inicial atenuado
 
         row0 = ttk.Frame(frm)
         row0.pack(fill=tk.X, pady=(0, 10))
@@ -112,9 +190,10 @@ class PyrusCryptGUI(tk.Tk):
         self.dev_var = tk.StringVar()
         self.dev_combo = ttk.Combobox(row0, textvariable=self.dev_var, width=60, state="readonly")
         self.dev_combo.pack(side=tk.LEFT, padx=8)
+        self.dev_combo.bind("<<ComboboxSelected>>", self.on_device_selected)
         ttk.Button(row0, text="Actualizar", command=self.refresh_devices).pack(side=tk.LEFT)
 
-        self.mount_warn = ttk.Label(frm, text="", foreground="#b45309")
+        self.mount_warn = ttk.Label(frm, text="", foreground="#00FF44")
         self.mount_warn.pack(anchor="w")
 
         sep1 = ttk.Separator(frm)
@@ -138,7 +217,7 @@ class PyrusCryptGUI(tk.Tk):
 
         self.do_fsck = tk.BooleanVar(value=True)
         self.do_minimize = tk.BooleanVar(value=True)
-        self.do_chroot = tk.BooleanVar(value=False)
+        self.do_chroot = tk.BooleanVar(value=True)
         ttk.Checkbutton(grid, text="Ejecutar e2fsck -f -y (recomendado)", variable=self.do_fsck).grid(row=3, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(grid, text="resize2fs -M antes del reencriptado", variable=self.do_minimize).grid(row=4, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(grid, text="Montar y configurar sistema (chroot + GRUB)", variable=self.do_chroot).grid(row=5, column=0, columnspan=2, sticky="w")
@@ -154,7 +233,7 @@ class PyrusCryptGUI(tk.Tk):
         self.start_btn.pack(side=tk.LEFT)
         ttk.Button(btns, text="Salir", command=self.destroy).pack(side=tk.RIGHT)
 
-        self.progress = ttk.Progressbar(frm, mode="indeterminate")
+        self.progress = ttk.Progressbar(frm, mode="determinate")
         self.progress.pack(fill=tk.X, pady=(6, 2))
         self.status_var = tk.StringVar(value="Listo.")
         ttk.Label(frm, textvariable=self.status_var).pack(anchor="w")
@@ -162,7 +241,7 @@ class PyrusCryptGUI(tk.Tk):
         sep3 = ttk.Separator(frm)
         sep3.pack(fill=tk.X, pady=8)
         ttk.Label(frm, text="Registro del proceso:").pack(anchor="w")
-        self.log = tk.Text(frm, height=20, wrap=tk.NONE)
+        self.log = tk.Text(frm, height=20, wrap=tk.NONE, background="#0F1C17", foreground="#D2B26E", insertbackground="#D2B26E", relief=tk.FLAT)
         self.log.pack(fill=tk.BOTH, expand=True)
         yscroll = ttk.Scrollbar(self.log, orient=tk.VERTICAL, command=self.log.yview)
         self.log.configure(yscrollcommand=yscroll.set)
@@ -231,7 +310,7 @@ class PyrusCryptGUI(tk.Tk):
             return
 
         self.start_btn.configure(state=tk.DISABLED)
-        self.progress.start(10)
+        self.progress['value'] = 0
         self.status_var.set("Ejecutando…")
 
         t = threading.Thread(target=self._worker, args=(device, p1, rsize, self.do_fsck.get(), self.do_minimize.get(), self.do_chroot.get()), daemon=True)
@@ -240,6 +319,16 @@ class PyrusCryptGUI(tk.Tk):
     def _worker(self, device, password, reduce_size, run_fsck, run_minimize, run_chroot):
         keyfile = None
         try:
+            steps = ["reencrypt"]
+            if run_fsck: steps.insert(0, "fsck")
+            if run_minimize: steps.insert(0, "minimize")
+            if run_chroot: steps.append("chroot")
+            
+            num_steps = len(steps)
+            progress_increment = 100 / num_steps
+            current_progress = 0
+            self.progress['value'] = 0
+
             tf = tempfile.NamedTemporaryFile(delete=False)
             tf.write(password.encode())
             tf.flush()
@@ -249,10 +338,14 @@ class PyrusCryptGUI(tk.Tk):
             if run_fsck:
                 self.append_log("\n== Paso 1/4: Comprobando sistema de archivos (e2fsck -f -y)… ==\n")
                 run_and_stream(["e2fsck", "-f", "-y", device], self.append_log)
+                current_progress += progress_increment
+                self.progress['value'] = current_progress
 
             if run_minimize:
                 self.append_log("\n== Paso 2/4: Redimensionando al mínimo (resize2fs -M)… ==\n")
                 run_and_stream(["resize2fs", "-M", device], self.append_log)
+                current_progress += progress_increment
+                self.progress['value'] = current_progress
 
             self.append_log("\n== Paso 3/4: Reencriptando con cryptsetup reencrypt (LUKS2)… ==\n")
             cmd = [
@@ -265,6 +358,8 @@ class PyrusCryptGUI(tk.Tk):
                 device,
             ]
             run_and_stream(cmd, self.append_log)
+            current_progress += progress_increment
+            self.progress['value'] = current_progress
 
             if run_chroot:
                 self.append_log("\n== Paso 4/4: Montaje, chroot y configuración ==\n")
@@ -312,7 +407,10 @@ class PyrusCryptGUI(tk.Tk):
                 base_disk = device.rstrip('0123456789')
                 run_and_stream(["chroot", "/mnt/root", "/bin/bash", "-c", f"grub-install {base_disk}"], self.append_log)
                 run_and_stream(["chroot", "/mnt/root", "/bin/bash", "-c", "update-grub"], self.append_log)
+                current_progress += progress_increment
+                self.progress['value'] = current_progress
 
+            self.progress['value'] = 100
             self.append_log("\n✔ Proceso completado correctamente.\n")
             self.status_var.set("Completado.")
             messagebox.showinfo("Éxito", "El proceso terminó correctamente.")
@@ -327,7 +425,7 @@ class PyrusCryptGUI(tk.Tk):
         finally:
             if keyfile and os.path.exists(keyfile):
                 os.remove(keyfile)
-            self.progress.stop()
+            self.progress['value'] = 0
             self.start_btn.configure(state=tk.NORMAL)
 
 if __name__ == "__main__":
