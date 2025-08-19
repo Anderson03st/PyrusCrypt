@@ -403,10 +403,6 @@ class PyrusCryptGUI(tk.Tk):
                 chroot_cmd = f"grep -q '^GRUB_CMDLINE_LINUX' /etc/default/grub && sed -i 's|^GRUB_CMDLINE_LINUX.*|{grub_line}|' /etc/default/grub || echo '{grub_line}' >> /etc/default/grub"
                 run_and_stream(["chroot", "/mnt/root", "/bin/bash", "-c", chroot_cmd], self.append_log)
 
-                # Detectar el disco principal (padre del dispositivo seleccionado)
-                base_disk = device.rstrip('0123456789')
-                run_and_stream(["chroot", "/mnt/root", "/bin/bash", "-c", f"grub-install {base_disk}"], self.append_log)
-                run_and_stream(["chroot", "/mnt/root", "/bin/bash", "-c", "update-grub"], self.append_log)
                 current_progress += progress_increment
                 self.progress['value'] = current_progress
 
