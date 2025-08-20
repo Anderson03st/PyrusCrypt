@@ -122,23 +122,32 @@ def create_boot_partition_if_missing(device: str, append_log):
         m = re.search(r"(\d+)$", dev_path)
         return m.group(1) if m else ""
 
+    def _parse_num_to_float(value_with_unit: str) -> float:
+        # Admite "0,48GiB" o "0.48GiB" → 0.48
+        raw = re.sub(r"[^0-9,\.\-]", "", value_with_unit)
+        raw = raw.replace(",", ".")
+        return float(raw)
+
     def _get_partition_geometry_gib(disk: str, part_num: str):
-        out = subprocess.check_output(["parted", "-m", disk, "unit", "GiB", "print", "free"], text=True)
+        env = os.environ.copy()
+        env.update({"LC_ALL": "C", "LANG": "C"})
+        out = subprocess.check_output(["parted", "-m", disk, "unit", "GiB", "print", "free"], text=True, env=env)
         for line in out.splitlines():
             if not line or line.startswith("BYT;") or line.startswith(disk):
                 continue
             fields = line.split(":")
             if fields[0] == part_num:
                 # fields: nr:start:end:size:fs:name:flags en GiB
-                start = fields[1]
-                end = fields[2]
-                size = fields[3]
-                if start.endswith("GiB") and end.endswith("GiB") and size.endswith("GiB"):
-                    return float(start[:-3]), float(end[:-3]), float(size[:-3])
+                start = _parse_num_to_float(fields[1])
+                end = _parse_num_to_float(fields[2])
+                size = _parse_num_to_float(fields[3])
+                return start, end, size
         raise RuntimeError("No se pudo obtener la geometría de la partición")
 
     def _get_table_type_and_last_part(disk: str):
-        out = subprocess.check_output(["parted", "-m", disk, "unit", "MiB", "print", "free"], text=True)
+        env = os.environ.copy()
+        env.update({"LC_ALL": "C", "LANG": "C"})
+        out = subprocess.check_output(["parted", "-m", disk, "unit", "MiB", "print", "free"], text=True, env=env)
         table_type = None
         max_part = None
         for line in out.splitlines():
