@@ -502,9 +502,9 @@ class PyrusCryptGUI(tk.Tk):
         keyfile = None
         try:
             steps = []
+            if run_boot: steps.append("boot")
             if run_fsck: steps.append("fsck")
             if run_minimize: steps.append("minimize")
-            if run_boot: steps.append("boot")
             steps.append("reencrypt")
             if run_chroot: steps.append("chroot")
             
@@ -520,6 +520,16 @@ class PyrusCryptGUI(tk.Tk):
             tf.close()
             keyfile = tf.name
 
+            if run_boot:
+                self.append_log(f"\n== Paso {step_no}/{num_steps}: Creando partición /boot si falta… ==\n")
+                try:
+                    create_boot_partition_if_missing(device, self.append_log)
+                except Exception as ex:
+                    self.append_log(f"[ADVERTENCIA] No se pudo crear /boot automáticamente: {ex}\n")
+                current_progress += progress_increment
+                self.progress['value'] = current_progress
+                step_no += 1
+
             if run_fsck:
                 self.append_log(f"\n== Paso {step_no}/{num_steps}: Comprobando sistema de archivos (e2fsck -f -y)… ==\n")
                 run_and_stream(["e2fsck", "-f", "-y", device], self.append_log)
@@ -530,16 +540,6 @@ class PyrusCryptGUI(tk.Tk):
             if run_minimize:
                 self.append_log(f"\n== Paso {step_no}/{num_steps}: Redimensionando al mínimo (resize2fs -M)… ==\n")
                 run_and_stream(["resize2fs", "-M", device], self.append_log)
-                current_progress += progress_increment
-                self.progress['value'] = current_progress
-                step_no += 1
-
-            if run_boot:
-                self.append_log(f"\n== Paso {step_no}/{num_steps}: Creando partición /boot si falta… ==\n")
-                try:
-                    create_boot_partition_if_missing(device, self.append_log)
-                except Exception as ex:
-                    self.append_log(f"[ADVERTENCIA] No se pudo crear /boot automáticamente: {ex}\n")
                 current_progress += progress_increment
                 self.progress['value'] = current_progress
                 step_no += 1
