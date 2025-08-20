@@ -182,12 +182,12 @@ def create_boot_partition_if_missing(device: str, append_log):
                 append_log(f"[ERROR] La partición seleccionada {part_num} no es la última del disco (última: {last_part}). No se puede reducir para liberar cola.\n")
                 return False, None
             start_gib, end_gib, size_gib = _get_partition_geometry_gib(base_disk, part_num)
-            # Reducimos aprox 1 GiB: primero el sistema de ficheros, luego la partición
-            fs_new_size_gib = max(1.0, size_gib - 1.0)
-            run_and_stream(["resize2fs", "-p", dev_path, f"{int(fs_new_size_gib)}G"], append_log)
-            new_end = max(start_gib + 1.0, end_gib - 1.0)
+            # Reducimos exactamente 1 GiB: primero el sistema de ficheros, luego la partición
+            fs_new_size_int_g = max(1, int(size_gib) - 1)
+            run_and_stream(["resize2fs", "-p", dev_path, f"{fs_new_size_int_g}G"], append_log)
+            new_end_int_gib = max(int(start_gib) + 1, int(end_gib) - 1)
             # Reducir partición
-            run_and_stream(["parted", base_disk, "--script", "unit", "GiB", "resizepart", part_num, f"{new_end:.2f}GiB"], append_log)
+            run_and_stream(["parted", base_disk, "--script", "unit", "GiB", "resizepart", part_num, f"{new_end_int_gib}GiB"], append_log)
             run_and_stream(["partprobe", base_disk], append_log, check=False)
             run_and_stream(["udevadm", "settle"], append_log, check=False)
             # Si se desmontó, re-montar para dejar el sistema como estaba
@@ -195,7 +195,7 @@ def create_boot_partition_if_missing(device: str, append_log):
                 append_log(f"Remontando {dev_path} en {remount_after}…\n")
                 run_and_stream(["mkdir", "-p", remount_after], append_log, check=False)
                 run_and_stream(["mount", dev_path, remount_after], append_log, check=False)
-            return True, new_end
+            return True, new_end_int_gib
         except Exception as ex:
             append_log(f"[ERROR] Falló la reducción de la partición: {ex}\n")
             return False, None
@@ -229,13 +229,16 @@ def create_boot_partition_if_missing(device: str, append_log):
     if not is_luks:
         ok, new_end_after_shrink = _shrink_partition_free_space(shrink_target, shrink_mountpoint)
         if not ok:
-            append_log("[AVISO] No se pudo liberar espacio automáticamente. Se intentará crear /boot igualmente.\n")
+            append_log("[ERROR] No se pudo liberar espacio automáticamente. No se puede crear /boot sin espacio libre.\n")
+            return
     else:
         append_log("[INFO] Omite reducción automática por ser LUKS directo.\n")
+        append_log("[ERROR] No se puede crear /boot sin espacio libre si la partición es LUKS.\n")
+        return
 
     # 2) Crear la partición de /boot
     try:
-        mk_start = f"{new_end_after_shrink:.2f}GiB" if new_end_after_shrink else "-1050MiB"
+        mk_start = f"{new_end_after_shrink}GiB"
         run_and_stream(["parted", base_disk, "--script", "mkpart", "primary", "ext4", mk_start, "100%"], append_log)
     except subprocess.CalledProcessError:
         if table_type.lower() == "msdos":
