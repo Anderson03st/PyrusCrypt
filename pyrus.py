@@ -270,7 +270,7 @@ class PyrusCryptGUI(tk.Tk):
         self.dev_combo['values'] = entries
         if entries:
             self.dev_combo.current(0)
-        self.mount_warn.configure(text=("⚠️ Hay particiones montadas. Desmóntalas antes de continuar:\n- " + "\n- ".join(warn_mounts)) if warn_mounts else "")
+        self.mount_warn.configure(text=("⚠️ Estas son las particiones montadas. Revisa antes de continuar:\n- " + "\n- ".join(warn_mounts)) if warn_mounts else "")
 
     def start(self):
         if os.geteuid() != 0:
