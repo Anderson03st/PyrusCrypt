@@ -101,22 +101,21 @@ def _get_base_disk_from_device(device_path: str) -> str:
 
 def create_boot_partition_if_missing(device: str, append_log):
     """
-    Verifica si existe /boot. Si no, crea una partición ext4 (~1GiB) al final del disco
-    si hay espacio libre, la formatea, copia /boot y añade a /etc/fstab.
+    Fuerza la creación de una partición /boot ext4 (~1GiB):
+    1) Intenta liberar ~1GiB al final del disco reduciendo la partición objetivo
+       (solo ext2/3/4, no LUKS directo), y 2) crea la nueva partición, la formatea,
+       copia /boot y añade la entrada a /etc/fstab.
     """
     parts_before = list_block_devices()
-    boot_detected = any(
-        p.get("fstype") in ("ext2", "ext3", "ext4") and (p.get("mountpoint") == "/boot")
-        for p in parts_before
-    )
-
-    if boot_detected:
-        append_log("Ya existe partición /boot. Continuando…\n")
-        return
-
-    append_log("No se detecta partición /boot. Intentando crear una nueva (~1GiB)…\n")
+    append_log("Liberando ~1GiB al final del disco y creando partición /boot (~1GiB)…\n")
 
     base_disk = _get_base_disk_from_device(device)
+    # Detectar tipo de la partición seleccionada
+    dev_info = next((p for p in parts_before if p.get("path") == device), None)
+    dev_fstype = (dev_info or {}).get("fstype")
+    is_luks = str(dev_fstype).lower() in ("crypto_luks", "luks")
+    if is_luks:
+        append_log("[INFO] El dispositivo seleccionado parece ser LUKS (crypto_LUKS). No se intentará reducir automáticamente la partición, ya que el FS está dentro del contenedor.\n")
     # Crear partición al final del disco si hay hueco (aprox 1GiB)
     # Usamos rangos negativos para apuntar al final del disco.
     def _get_partition_number(dev_path: str) -> str:
@@ -136,9 +135,38 @@ def create_boot_partition_if_missing(device: str, append_log):
                     return float(end[:-3])
         raise RuntimeError("No se pudo obtener el fin de la partición")
 
-    def _shrink_partition_free_space(dev_path: str) -> bool:
+    def _get_table_type_and_last_part(disk: str):
+        out = subprocess.check_output(["parted", "-m", disk, "unit", "MiB", "print", "free"], text=True)
+        table_type = None
+        max_part = None
+        for line in out.splitlines():
+            if line.startswith(disk):
+                # Ej: /dev/sda:...:scsi:512:512:gpt:...
+                parts = line.split(":")
+                if len(parts) >= 6:
+                    table_type = parts[5]
+            elif line and line[0].isdigit():
+                num = line.split(":", 1)[0]
+                try:
+                    val = int(num)
+                    if max_part is None or val > max_part:
+                        max_part = val
+                except ValueError:
+                    pass
+        return table_type or "unknown", max_part
+
+    def _shrink_partition_free_space(dev_path: str, current_mountpoint: str | None) -> bool:
         try:
             append_log("Intentando liberar ~1GiB reduciendo la partición raíz…\n")
+            # Si está montada, intentar desmontar salvo que sea '/'
+            remount_after = None
+            if current_mountpoint:
+                if current_mountpoint == "/":
+                    append_log("[ERROR] La partición objetivo está montada como '/'. Ejecuta desde un entorno live/rescue para poder reducirla.\n")
+                    return False
+                append_log(f"Desmontando {dev_path} de {current_mountpoint}…\n")
+                run_and_stream(["umount", dev_path], append_log)
+                remount_after = current_mountpoint
             # Asegurar integridad y minimizar FS
             run_and_stream(["e2fsck", "-f", "-y", dev_path], append_log)
             run_and_stream(["resize2fs", "-M", dev_path], append_log)
@@ -147,30 +175,67 @@ def create_boot_partition_if_missing(device: str, append_log):
             if not part_num:
                 append_log("[ERROR] No se pudo determinar el número de partición.\n")
                 return False
+            table_type, last_part = _get_table_type_and_last_part(base_disk)
+            if str(part_num) != str(last_part):
+                append_log(f"[ERROR] La partición seleccionada {part_num} no es la última del disco (última: {last_part}). No se puede reducir para liberar cola.\n")
+                return False
             current_end = _get_partition_end_mib(base_disk, part_num)
             new_end = max(1.0, current_end - 1050.0)
             # Reducir partición
             run_and_stream(["parted", base_disk, "--script", "unit", "MiB", "resizepart", part_num, str(int(new_end)) + "MiB"], append_log)
             run_and_stream(["partprobe", base_disk], append_log, check=False)
             run_and_stream(["udevadm", "settle"], append_log, check=False)
+            # Si se desmontó, re-montar para dejar el sistema como estaba
+            if remount_after:
+                append_log(f"Remontando {dev_path} en {remount_after}…\n")
+                run_and_stream(["mkdir", "-p", remount_after], append_log, check=False)
+                run_and_stream(["mount", dev_path, remount_after], append_log, check=False)
             return True
         except Exception as ex:
             append_log(f"[ERROR] Falló la reducción de la partición: {ex}\n")
             return False
 
+    # Determinar mejor objetivo de reducción: la partición montada en '/'
+    shrink_target = device
+    shrink_mountpoint = None
+    try:
+        current = list_block_devices()
+        # Preferir la partición montada en '/'
+        root_parts = [p for p in current if p.get("mountpoint") == "/" and p.get("type") == "part"]
+        if root_parts:
+            shrink_target = root_parts[0]["path"]
+            shrink_mountpoint = "/"
+            if shrink_target != device:
+                append_log(f"Usando {shrink_target} como partición raíz para liberar espacio (seleccionado: {device}).\n")
+        else:
+            # Si no hay '/', mirar si el propio device está montado en algún sitio
+            mp = next((p.get("mountpoint") for p in current if p.get("path") == device and p.get("mountpoint")), None)
+            if mp:
+                shrink_mountpoint = mp
+    except Exception:
+        pass
+
+    # Log de tabla y última partición
+    table_type, last_part = _get_table_type_and_last_part(base_disk)
+    append_log(f"Tabla de particiones detectada: {table_type}. Última partición: {last_part}\n")
+
+    # 1) Intentar liberar espacio primero (si no es LUKS)
+    if not is_luks:
+        _shrink_partition_free_space(shrink_target, shrink_mountpoint)
+    else:
+        append_log("[INFO] Omite reducción automática por ser LUKS directo.\n")
+
+    # 2) Crear la partición de /boot
     try:
         run_and_stream(["parted", base_disk, "--script", "mkpart", "primary", "ext4", "-1050MiB", "-1MiB"], append_log)
     except subprocess.CalledProcessError:
-        # Intentar liberar espacio reduciendo la partición seleccionada
-        if _shrink_partition_free_space(device):
-            try:
-                run_and_stream(["parted", base_disk, "--script", "mkpart", "primary", "ext4", "-1050MiB", "-1MiB"], append_log)
-            except subprocess.CalledProcessError:
-                append_log("[ERROR] No fue posible crear la partición /boot tras reducir.\n")
-                return
+        if table_type.lower() == "msdos":
+            append_log("[PISTA] Si el disco usa tabla MSDOS y ya hay 4 primarias, crea/usa una extendida o migra a GPT.\n")
+        if is_luks:
+            append_log("[ERROR] No fue posible crear /boot: no hay espacio al final y no podemos reducir una partición LUKS sin abrir y encoger el FS interno.\n")
         else:
-            append_log("[ERROR] No fue posible crear la partición /boot. Puede que no haya espacio libre.\n")
-            return
+            append_log("[ERROR] No fue posible crear /boot. Verifica que la partición objetivo sea la última y que se pudo liberar espacio.\n")
+        return
 
     # Notificar al kernel y esperar a que aparezca la nueva partición
     run_and_stream(["partprobe", base_disk], append_log, check=False)
