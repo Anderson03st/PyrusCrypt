@@ -187,6 +187,39 @@ def create_boot_partition_if_missing(device: str, append_log):
                     last_free = (start_s, end_s)
         return last_free
 
+    def _get_disk_total_sectors(disk: str) -> int:
+        env = os.environ.copy()
+        env.update({"LC_ALL": "C", "LANG": "C"})
+        out = subprocess.check_output(["parted", "-m", disk, "unit", "s", "print"], text=True, env=env)
+        for line in out.strip().splitlines():
+            if line.startswith(disk):
+                parts = line.split(":")
+                if len(parts) >= 2 and parts[1].endswith("s"):
+                    return int(re.sub(r"[^0-9]", "", parts[1]))
+        raise RuntimeError("No se pudo obtener el tamaño total en sectores")
+
+    def _get_last_partition_end_sectors(disk: str) -> int:
+        env = os.environ.copy()
+        env.update({"LC_ALL": "C", "LANG": "C"})
+        out = subprocess.check_output(["parted", "-m", disk, "unit", "s", "print"], text=True, env=env)
+        last_num = -1
+        last_end = -1
+        for line in out.strip().splitlines():
+            if line and line[0].isdigit():
+                fields = line.split(":")
+                try:
+                    num = int(fields[0])
+                except Exception:
+                    continue
+                if num >= last_num:
+                    last_num = num
+                    end_val = re.sub(r"[^0-9]", "", fields[2])
+                    if end_val:
+                        last_end = int(end_val)
+        if last_end <= 0:
+            raise RuntimeError("No se pudo obtener el fin de la última partición")
+        return last_end
+
     def _shrink_partition_free_space(dev_path: str, current_mountpoint: str | None):
         try:
             append_log("Intentando liberar ~2GiB reduciendo la partición raíz…\n")
@@ -279,9 +312,17 @@ def create_boot_partition_if_missing(device: str, append_log):
     # 2) Crear la partición de /boot (método robusto por sectores)
     free_range = _get_last_free_range_sectors(base_disk)
     if not free_range:
-        append_log("[ERROR] No se encontró espacio libre al final del disco tras la reducción.\n")
-        return
-    start_s, end_s = free_range
+        # Fallback: calcular desde el final de la última partición hasta el final del disco
+        try:
+            last_end_s = _get_last_partition_end_sectors(base_disk)
+            total_s = _get_disk_total_sectors(base_disk)
+            start_s, end_s = last_end_s + 1, total_s
+            append_log(f"No se reportó 'free' por parted; usando rango calculado: start={start_s}s end={end_s}s\n")
+        except Exception as ex:
+            append_log(f"[ERROR] No se encontró espacio libre al final del disco tras la reducción: {ex}\n")
+            return
+    else:
+        start_s, end_s = free_range
     # Reservar 34 sectores para la GPT secundaria; crear partición prácticamente hasta el final
     new_end_s = max(start_s + 2048, end_s - 34)
     if new_end_s <= start_s:
