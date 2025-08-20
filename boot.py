@@ -169,7 +169,7 @@ def create_boot_partition_if_missing(device: str, append_log):
 
     def _shrink_partition_free_space(dev_path: str, current_mountpoint: str | None):
         try:
-            append_log("Intentando liberar ~1GiB reduciendo la partición raíz…\n")
+            append_log("Intentando liberar ~2GiB reduciendo la partición raíz…\n")
             # Si está montada, intentar desmontar salvo que sea '/'
             remount_after = None
             if current_mountpoint:
@@ -191,18 +191,14 @@ def create_boot_partition_if_missing(device: str, append_log):
                 append_log(f"[ERROR] La partición seleccionada {part_num} no es la última del disco (última: {last_part}). No se puede reducir para liberar cola.\n")
                 return False, None
             start_gib, end_gib, size_gib = _get_partition_geometry_gib(base_disk, part_num)
-            # Reducimos exactamente 1 GiB: primero el sistema de ficheros al tamaño objetivo (GiB enteros), luego la partición
-            fs_new_size_int_g = max(1, math.floor(size_gib) - 1)
+            # Reducimos 2 GiB: primero el sistema de ficheros al tamaño objetivo entero en GiB, luego la partición
+            fs_new_size_int_g = max(1, math.floor(size_gib) - 2)
             run_and_stream(["resize2fs", "-p", dev_path, f"{fs_new_size_int_g}G"], append_log)
-            # Elegir nuevo fin alineado hacia abajo a 0.01 GiB y garantizando margen de 1 GiB
-            target_end_gib = end_gib - 1.0
-            new_end_floor_2dp = math.floor(target_end_gib * 100.0) / 100.0
-            # Garantizar que no invada el inicio y deje al menos 1 GiB de tamaño
-            min_allowed_end = start_gib + 1.0
-            new_end_gib = max(min_allowed_end, new_end_floor_2dp)
-            append_log(f"Reduciendo partición {part_num}: fin actual {end_gib:.2f}GiB → nuevo fin {new_end_gib:.2f}GiB\n")
+            # Nuevo fin en GiB enteros: fin_actual - 2 GiB
+            target_end_int_gib = max(int(start_gib) + 1, int(math.floor(end_gib)) - 2)
+            append_log(f"Reduciendo partición {part_num}: fin actual {end_gib:.2f}GiB → nuevo fin {target_end_int_gib}GiB\n")
             # Reducir partición
-            run_and_stream(["parted", base_disk, "--script", "-a", "optimal", "unit", "GiB", "resizepart", part_num, f"{new_end_gib:.2f}GiB"], append_log)
+            run_and_stream(["parted", base_disk, "--script", "-a", "optimal", "unit", "GiB", "resizepart", part_num, f"{target_end_int_gib}GiB"], append_log, check=False)
             run_and_stream(["partprobe", base_disk], append_log, check=False)
             run_and_stream(["udevadm", "settle"], append_log, check=False)
             # Si se desmontó, re-montar para dejar el sistema como estaba
@@ -210,7 +206,7 @@ def create_boot_partition_if_missing(device: str, append_log):
                 append_log(f"Remontando {dev_path} en {remount_after}…\n")
                 run_and_stream(["mkdir", "-p", remount_after], append_log, check=False)
                 run_and_stream(["mount", dev_path, remount_after], append_log, check=False)
-            return True, new_end_gib
+            return True, float(target_end_int_gib)
         except Exception as ex:
             append_log(f"[ERROR] Falló la reducción de la partición: {ex}\n")
             return False, None
