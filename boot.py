@@ -167,6 +167,26 @@ def create_boot_partition_if_missing(device: str, append_log):
                     pass
         return table_type or "unknown", max_part
 
+    def _get_last_free_range_sectors(disk: str):
+        """Devuelve (start_s, end_s) del último rango libre al final del disco (unit s)."""
+        env = os.environ.copy()
+        env.update({"LC_ALL": "C", "LANG": "C"})
+        out = subprocess.check_output(["parted", "-m", disk, "unit", "s", "print", "free"], text=True, env=env)
+        last_free = None
+        for line in out.strip().splitlines():
+            if not line or line.startswith("BYT;") or line.startswith(disk):
+                continue
+            fields = line.split(":")
+            # free rows usually have 'free' in the last col
+            if len(fields) >= 7 and fields[-1].strip().lower() == "free":
+                start_val = re.sub(r"[^0-9]", "", fields[1])
+                end_val = re.sub(r"[^0-9]", "", fields[2])
+                if start_val and end_val:
+                    start_s = int(start_val)
+                    end_s = int(end_val)
+                    last_free = (start_s, end_s)
+        return last_free
+
     def _shrink_partition_free_space(dev_path: str, current_mountpoint: str | None):
         try:
             append_log("Intentando liberar ~2GiB reduciendo la partición raíz…\n")
@@ -224,10 +244,19 @@ def create_boot_partition_if_missing(device: str, append_log):
             if shrink_target != device:
                 append_log(f"Usando {shrink_target} como partición raíz para liberar espacio (seleccionado: {device}).\n")
         else:
-            # Si no hay '/', mirar si el propio device está montado en algún sitio
-            mp = next((p.get("mountpoint") for p in current if p.get("path") == device and p.get("mountpoint")), None)
-            if mp:
-                shrink_mountpoint = mp
+            # Si no hay '/', buscar última partición del disco base (preferiblemente ext*)
+            base = _get_base_disk_from_device(device)
+            parts_on_disk = [p for p in current if p.get("type") == "part" and p.get("path", "").startswith(base)]
+            def _part_num(p):
+                m = re.search(r"(\d+)$", p.get("path", ""))
+                return int(m.group(1)) if m else -1
+            parts_on_disk.sort(key=_part_num)
+            ext_parts = [p for p in parts_on_disk if (p.get("fstype") or "").startswith("ext")]
+            pick = (ext_parts[-1] if ext_parts else (parts_on_disk[-1] if parts_on_disk else None))
+            if pick:
+                shrink_target = pick["path"]
+                shrink_mountpoint = pick.get("mountpoint")
+                append_log(f"Usando {shrink_target} como objetivo de reducción (última partición del disco).\n")
     except Exception:
         pass
 
@@ -247,17 +276,23 @@ def create_boot_partition_if_missing(device: str, append_log):
         append_log("[ERROR] No se puede crear /boot sin espacio libre si la partición es LUKS.\n")
         return
 
-    # 2) Crear la partición de /boot
+    # 2) Crear la partición de /boot (método robusto por sectores)
+    free_range = _get_last_free_range_sectors(base_disk)
+    if not free_range:
+        append_log("[ERROR] No se encontró espacio libre al final del disco tras la reducción.\n")
+        return
+    start_s, end_s = free_range
+    # Reservar 34 sectores para la GPT secundaria; crear partición prácticamente hasta el final
+    new_end_s = max(start_s + 2048, end_s - 34)
+    if new_end_s <= start_s:
+        append_log("[ERROR] El rango libre es demasiado pequeño para /boot.\n")
+        return
     try:
-        mk_start = f"{new_end_after_shrink}GiB"
-        run_and_stream(["parted", base_disk, "--script", "mkpart", "primary", "ext4", mk_start, "100%"], append_log)
+        run_and_stream(["parted", base_disk, "--script", "-a", "optimal", "unit", "s", "mkpart", "primary", "ext4", str(start_s), str(new_end_s)], append_log)
     except subprocess.CalledProcessError:
         if table_type.lower() == "msdos":
             append_log("[PISTA] Si el disco usa tabla MSDOS y ya hay 4 primarias, crea/usa una extendida o migra a GPT.\n")
-        if is_luks:
-            append_log("[ERROR] No fue posible crear /boot: no hay espacio al final y no podemos reducir una partición LUKS sin abrir y encoger el FS interno.\n")
-        else:
-            append_log("[ERROR] No fue posible crear /boot. Verifica que la partición objetivo sea la última y que se pudo liberar espacio.\n")
+        append_log("[ERROR] No fue posible crear /boot en el rango libre detectado.\n")
         return
 
     # Notificar al kernel y esperar a que aparezca la nueva partición
