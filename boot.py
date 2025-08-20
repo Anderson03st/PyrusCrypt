@@ -122,18 +122,20 @@ def create_boot_partition_if_missing(device: str, append_log):
         m = re.search(r"(\d+)$", dev_path)
         return m.group(1) if m else ""
 
-    def _get_partition_end_mib(disk: str, part_num: str) -> float:
-        out = subprocess.check_output(["parted", "-m", disk, "unit", "MiB", "print", "free"], text=True)
+    def _get_partition_geometry_gib(disk: str, part_num: str):
+        out = subprocess.check_output(["parted", "-m", disk, "unit", "GiB", "print", "free"], text=True)
         for line in out.splitlines():
             if not line or line.startswith("BYT;") or line.startswith(disk):
                 continue
             fields = line.split(":")
             if fields[0] == part_num:
-                # fields: nr:start:end:size:fs:name:flags
+                # fields: nr:start:end:size:fs:name:flags en GiB
+                start = fields[1]
                 end = fields[2]
-                if end.endswith("MiB"):
-                    return float(end[:-3])
-        raise RuntimeError("No se pudo obtener el fin de la partición")
+                size = fields[3]
+                if start.endswith("GiB") and end.endswith("GiB") and size.endswith("GiB"):
+                    return float(start[:-3]), float(end[:-3]), float(size[:-3])
+        raise RuntimeError("No se pudo obtener la geometría de la partición")
 
     def _get_table_type_and_last_part(disk: str):
         out = subprocess.check_output(["parted", "-m", disk, "unit", "MiB", "print", "free"], text=True)
@@ -155,7 +157,7 @@ def create_boot_partition_if_missing(device: str, append_log):
                     pass
         return table_type or "unknown", max_part
 
-    def _shrink_partition_free_space(dev_path: str, current_mountpoint: str | None) -> bool:
+    def _shrink_partition_free_space(dev_path: str, current_mountpoint: str | None):
         try:
             append_log("Intentando liberar ~1GiB reduciendo la partición raíz…\n")
             # Si está montada, intentar desmontar salvo que sea '/'
@@ -178,11 +180,14 @@ def create_boot_partition_if_missing(device: str, append_log):
             table_type, last_part = _get_table_type_and_last_part(base_disk)
             if str(part_num) != str(last_part):
                 append_log(f"[ERROR] La partición seleccionada {part_num} no es la última del disco (última: {last_part}). No se puede reducir para liberar cola.\n")
-                return False
-            current_end = _get_partition_end_mib(base_disk, part_num)
-            new_end = max(1.0, current_end - 1050.0)
+                return False, None
+            start_gib, end_gib, size_gib = _get_partition_geometry_gib(base_disk, part_num)
+            # Reducimos aprox 1 GiB: primero el sistema de ficheros, luego la partición
+            fs_new_size_gib = max(1.0, size_gib - 1.0)
+            run_and_stream(["resize2fs", "-p", dev_path, f"{int(fs_new_size_gib)}G"], append_log)
+            new_end = max(start_gib + 1.0, end_gib - 1.0)
             # Reducir partición
-            run_and_stream(["parted", base_disk, "--script", "unit", "MiB", "resizepart", part_num, str(int(new_end)) + "MiB"], append_log)
+            run_and_stream(["parted", base_disk, "--script", "unit", "GiB", "resizepart", part_num, f"{new_end:.2f}GiB"], append_log)
             run_and_stream(["partprobe", base_disk], append_log, check=False)
             run_and_stream(["udevadm", "settle"], append_log, check=False)
             # Si se desmontó, re-montar para dejar el sistema como estaba
@@ -190,10 +195,10 @@ def create_boot_partition_if_missing(device: str, append_log):
                 append_log(f"Remontando {dev_path} en {remount_after}…\n")
                 run_and_stream(["mkdir", "-p", remount_after], append_log, check=False)
                 run_and_stream(["mount", dev_path, remount_after], append_log, check=False)
-            return True
+            return True, new_end
         except Exception as ex:
             append_log(f"[ERROR] Falló la reducción de la partición: {ex}\n")
-            return False
+            return False, None
 
     # Determinar mejor objetivo de reducción: la partición montada en '/'
     shrink_target = device
@@ -220,14 +225,18 @@ def create_boot_partition_if_missing(device: str, append_log):
     append_log(f"Tabla de particiones detectada: {table_type}. Última partición: {last_part}\n")
 
     # 1) Intentar liberar espacio primero (si no es LUKS)
+    new_end_after_shrink = None
     if not is_luks:
-        _shrink_partition_free_space(shrink_target, shrink_mountpoint)
+        ok, new_end_after_shrink = _shrink_partition_free_space(shrink_target, shrink_mountpoint)
+        if not ok:
+            append_log("[AVISO] No se pudo liberar espacio automáticamente. Se intentará crear /boot igualmente.\n")
     else:
         append_log("[INFO] Omite reducción automática por ser LUKS directo.\n")
 
     # 2) Crear la partición de /boot
     try:
-        run_and_stream(["parted", base_disk, "--script", "mkpart", "primary", "ext4", "-1050MiB", "-1MiB"], append_log)
+        mk_start = f"{new_end_after_shrink:.2f}GiB" if new_end_after_shrink else "-1050MiB"
+        run_and_stream(["parted", base_disk, "--script", "mkpart", "primary", "ext4", mk_start, "100%"], append_log)
     except subprocess.CalledProcessError:
         if table_type.lower() == "msdos":
             append_log("[PISTA] Si el disco usa tabla MSDOS y ya hay 4 primarias, crea/usa una extendida o migra a GPT.\n")
@@ -253,21 +262,29 @@ def create_boot_partition_if_missing(device: str, append_log):
     new_boot = new_parts[-1]
     append_log(f"Nueva partición detectada: {new_boot}\n")
 
-    # Formatear como ext4 y copiar contenido de /boot
+    # Formatear como ext4 y copiar contenido de /boot usando rsync
     run_and_stream(["mkfs.ext4", "-L", "BOOT", new_boot], append_log)
-    run_and_stream(["mkdir", "-p", "/mnt/tmpboot"], append_log)
-    run_and_stream(["mount", new_boot, "/mnt/tmpboot"], append_log)
-    # Copia robusta (incluye archivos ocultos)
-    run_and_stream(["bash", "-c", "cp -a /boot/. /mnt/tmpboot/"], append_log)
-    run_and_stream(["umount", "/mnt/tmpboot"], append_log)
+    root_mount = "/mnt"
+    run_and_stream(["mkdir", "-p", root_mount], append_log, check=False)
+    # Montar raíz si no es la actual
+    source_root = "/" if shrink_mountpoint == "/" else root_mount
+    if source_root == root_mount:
+        run_and_stream(["mount", shrink_target, root_mount], append_log, check=False)
+    run_and_stream(["mkdir", "-p", f"{source_root}/newboot"], append_log, check=False)
+    run_and_stream(["mount", new_boot, f"{source_root}/newboot"], append_log)
+    run_and_stream(["bash", "-c", f"rsync -aHAXx {source_root}/boot/ {source_root}/newboot/"], append_log)
+    run_and_stream(["umount", f"{source_root}/newboot"], append_log)
+    run_and_stream(["mkdir", "-p", f"{source_root}/boot"], append_log, check=False)
+    run_and_stream(["mount", new_boot, f"{source_root}/boot"], append_log, check=False)
 
-    # Añadir a fstab del sistema actual
+    # Añadir a fstab del root montado si existe, si no al actual
     try:
         boot_uuid = subprocess.check_output(["blkid", "-s", "UUID", "-o", "value", new_boot], text=True).strip()
     except Exception as ex:
         append_log(f"[ERROR] No se pudo obtener UUID de {new_boot}: {ex}\n")
         return
-    run_and_stream(["bash", "-c", f"echo 'UUID={boot_uuid} /boot ext4 defaults 0 2' >> /etc/fstab"], append_log)
+    fstab_target = f"{source_root}/etc/fstab" if source_root != "/" else "/etc/fstab"
+    run_and_stream(["bash", "-c", f"echo 'UUID={boot_uuid} /boot ext4 defaults 0 2' >> {fstab_target}"], append_log)
     append_log("Partición /boot creada y configurada correctamente (ext4).\n")
 
 
