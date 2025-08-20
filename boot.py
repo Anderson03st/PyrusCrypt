@@ -220,6 +220,31 @@ def create_boot_partition_if_missing(device: str, append_log):
             raise RuntimeError("No se pudo obtener el fin de la última partición")
         return last_end
 
+    def _get_partition_end_sectors(disk: str, part_num: str) -> int:
+        env = os.environ.copy()
+        env.update({"LC_ALL": "C", "LANG": "C"})
+        out = subprocess.check_output(["parted", "-m", disk, "unit", "s", "print"], text=True, env=env)
+        for line in out.strip().splitlines():
+            if line and line.split(":",1)[0] == str(part_num):
+                fields = line.split(":")
+                end_val = re.sub(r"[^0-9]", "", fields[2])
+                if end_val:
+                    return int(end_val)
+        raise RuntimeError("No se pudo obtener el fin de la partición en sectores")
+
+    def _get_logical_sector_size(disk: str) -> int:
+        env = os.environ.copy()
+        env.update({"LC_ALL": "C", "LANG": "C"})
+        out = subprocess.check_output(["parted", "-m", disk, "print"], text=True, env=env)
+        for line in out.strip().splitlines():
+            if line.startswith(disk):
+                parts = line.split(":")
+                try:
+                    return int(parts[3])
+                except Exception:
+                    return 512
+        return 512
+
     def _shrink_partition_free_space(dev_path: str, current_mountpoint: str | None):
         try:
             append_log("Intentando liberar ~2GiB reduciendo la partición raíz…\n")
@@ -244,14 +269,16 @@ def create_boot_partition_if_missing(device: str, append_log):
                 append_log(f"[ERROR] La partición seleccionada {part_num} no es la última del disco (última: {last_part}). No se puede reducir para liberar cola.\n")
                 return False, None
             start_gib, end_gib, size_gib = _get_partition_geometry_gib(base_disk, part_num)
-            # Reducimos 2 GiB: primero el sistema de ficheros al tamaño objetivo entero en GiB, luego la partición
+            # Reducimos 2 GiB: primero el sistema de ficheros al tamaño objetivo entero en GiB
             fs_new_size_int_g = max(1, math.floor(size_gib) - 2)
             run_and_stream(["resize2fs", "-p", dev_path, f"{fs_new_size_int_g}G"], append_log)
-            # Nuevo fin en GiB enteros: fin_actual - 2 GiB
-            target_end_int_gib = max(int(start_gib) + 1, int(math.floor(end_gib)) - 2)
-            append_log(f"Reduciendo partición {part_num}: fin actual {end_gib:.2f}GiB → nuevo fin {target_end_int_gib}GiB\n")
-            # Reducir partición
-            run_and_stream(["parted", base_disk, "--script", "-a", "optimal", "unit", "GiB", "resizepart", part_num, f"{target_end_int_gib}GiB"], append_log, check=False)
+            # Reducir partición por sectores (más robusto)
+            sector_size = _get_logical_sector_size(base_disk)
+            delta_s = int((2 * 1024 * 1024 * 1024) / sector_size)
+            current_end_s = _get_partition_end_sectors(base_disk, part_num)
+            new_end_s = max(current_end_s - delta_s, int((start_gib + 1) * (1024 * 1024 * 1024 / sector_size)))
+            append_log(f"Reduciendo partición {part_num}: fin actual {end_gib:.2f}GiB → nuevo fin ~{(new_end_s*sector_size)/(1024*1024*1024):.2f}GiB (sectores)\n")
+            run_and_stream(["parted", base_disk, "--script", "-a", "optimal", "unit", "s", "resizepart", part_num, str(new_end_s)], append_log, check=False)
             run_and_stream(["partprobe", base_disk], append_log, check=False)
             run_and_stream(["udevadm", "settle"], append_log, check=False)
             # Si se desmontó, re-montar para dejar el sistema como estaba
@@ -259,7 +286,7 @@ def create_boot_partition_if_missing(device: str, append_log):
                 append_log(f"Remontando {dev_path} en {remount_after}…\n")
                 run_and_stream(["mkdir", "-p", remount_after], append_log, check=False)
                 run_and_stream(["mount", dev_path, remount_after], append_log, check=False)
-            return True, float(target_end_int_gib)
+            return True, float(new_end_s * sector_size) / (1024*1024*1024)
         except Exception as ex:
             append_log(f"[ERROR] Falló la reducción de la partición: {ex}\n")
             return False, None
@@ -311,25 +338,37 @@ def create_boot_partition_if_missing(device: str, append_log):
 
     # 2) Crear la partición de /boot (método robusto por sectores)
     free_range = _get_last_free_range_sectors(base_disk)
+    sector_size = _get_logical_sector_size(base_disk)
     if not free_range:
         # Fallback: calcular desde el final de la última partición hasta el final del disco
         try:
             last_end_s = _get_last_partition_end_sectors(base_disk)
             total_s = _get_disk_total_sectors(base_disk)
-            start_s, end_s = last_end_s + 1, total_s
-            append_log(f"No se reportó 'free' por parted; usando rango calculado: start={start_s}s end={end_s}s\n")
+            start_s_calc, end_s_calc = last_end_s + 1, total_s
+            append_log(f"No se reportó 'free' por parted; usando rango calculado: start={start_s_calc}s end={end_s_calc}s\n")
+            start_s, end_s = start_s_calc, end_s_calc
         except Exception as ex:
             append_log(f"[ERROR] No se encontró espacio libre al final del disco tras la reducción: {ex}\n")
             return
     else:
         start_s, end_s = free_range
+    # Dimensionar /boot a ~1GiB exacto en sectores y reservar GPT de respaldo (34 sectores)
+    gpt_reserve = 34
+    boot_size_s = int((1 * 1024 * 1024 * 1024) / sector_size)
+    end_use = end_s - gpt_reserve
+    last_end_s = _get_last_partition_end_sectors(base_disk)
+    start_min = last_end_s + 1
+    start_use = max(start_min, end_use - boot_size_s + 1)
+    if start_use >= end_use:
+        append_log("[ERROR] El rango libre final no es suficiente para 1GiB de /boot. Reduce un poco más la raíz.\n")
+        return
     # Reservar 34 sectores para la GPT secundaria; crear partición prácticamente hasta el final
     new_end_s = max(start_s + 2048, end_s - 34)
     if new_end_s <= start_s:
         append_log("[ERROR] El rango libre es demasiado pequeño para /boot.\n")
         return
     try:
-        run_and_stream(["parted", base_disk, "--script", "-a", "optimal", "unit", "s", "mkpart", "primary", "ext4", str(start_s), str(new_end_s)], append_log)
+        run_and_stream(["parted", base_disk, "--script", "-a", "optimal", "unit", "s", "mkpart", "primary", "ext4", str(start_use), str(end_use)], append_log)
     except subprocess.CalledProcessError:
         if table_type.lower() == "msdos":
             append_log("[PISTA] Si el disco usa tabla MSDOS y ya hay 4 primarias, crea/usa una extendida o migra a GPT.\n")
